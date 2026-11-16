@@ -1,0 +1,126 @@
+name: Build SlotBound Android APK
+
+# 手动触发构建。改游戏后 push 也会自动构建。
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4G -Dorg.gradle.daemon=false"
+
+    steps:
+      - name: Checkout this repo (contains game.love + icons)
+        uses: actions/checkout@v4
+        with:
+          path: game-src
+
+      # love-android 11.5a = LÖVE 11.5 engine, needs recursive submodules.
+      - name: Checkout love-android 11.5a
+        uses: actions/checkout@v4
+        with:
+          repository: love2d/love-android
+          ref: 11.5a
+          submodules: recursive
+          path: love-android
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install CMake >= 3.21 and Ninja
+        run: |
+          curl -Lo kitware-archive.sh https://apt.kitware.com/kitware-archive.sh
+          sudo bash ./kitware-archive.sh
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake
+          cmake --version
+
+      - name: Install exact NDK / SDK platform / build-tools
+        run: |
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-34" "build-tools;34.0.0" "ndk;25.2.9519653"
+
+      # Reassemble game.love from parts if the repo only contains split parts
+      # (web upload has a 25MB per-file limit). Otherwise use the whole file.
+      - name: Reassemble game.love
+        run: |
+          set -e
+          cd game-src
+          # Locate the parts wherever they were uploaded (root or web-upload/).
+          PART1=$(find . -name 'game.love.part01' | head -1)
+          WHOLE=$(find . -name 'game.love' -type f | head -1)
+          if [ -n "$PART1" ]; then
+            echo "Found split parts, reassembling..."
+            BASE=$(dirname "$PART1")
+            cat "$BASE"/game.love.part01 "$BASE"/game.love.part02 "$BASE"/game.love.part03 > game.love
+            echo "Reassembled game.love"
+          elif [ -n "$WHOLE" ]; then
+            echo "Found whole game.love, using directly: $WHOLE"
+            cp "$WHOLE" game.love
+          else
+            echo "ERROR: no game.love or parts found!" && exit 1
+          fi
+          ls -lh game.love
+
+      # Embed the game: game.love must sit at app/src/embed/assets/game.love
+      - name: Embed game.love
+        run: |
+          mkdir -p love-android/app/src/embed/assets
+          cp game-src/game.love love-android/app/src/embed/assets/game.love
+          ls -lh love-android/app/src/embed/assets/game.love
+
+      # Replace launcher icons with the game icon (Manifest uses @drawable/love).
+      - name: Set app icons
+        run: |
+          ICONBASE=$(find game-src -type d -name 'drawable-hdpi' | head -1)
+          if [ -n "$ICONBASE" ]; then
+            cp -r $(dirname "$ICONBASE")/drawable-* love-android/app/src/main/res/
+            echo "Icons installed from $ICONBASE"
+          else
+            echo "No custom icons found, keeping LÖVE defaults"
+          fi
+
+      # Branding: set app name / id / orientation / version.
+      # Comment out the default app.name_byte_array so app.name can be used.
+      - name: Configure branding
+        working-directory: love-android
+        run: |
+          sed -i 's/^app\.name_byte_array=/#app.name_byte_array=/' gradle.properties
+          {
+            echo ""
+            echo "app.name=SlotBound"
+            echo "app.application_id=com.slotbound.android"
+            echo "app.orientation=landscape"
+            echo "app.version_code=1"
+            echo "app.version_name=1.0.0"
+          } >> gradle.properties
+          tail -12 gradle.properties
+
+      # Debug variant is signed with the auto debug keystore -> installs directly.
+      - name: Build embed Debug APK
+        working-directory: love-android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleEmbedNoRecordDebug --no-daemon --stacktrace
+
+      - name: Locate and rename APK
+        run: |
+          APK=$(find love-android/app/build/outputs/apk -name "*.apk" | head -1)
+          echo "APK path: $APK"
+          cp "$APK" SlotBound.apk
+          ls -lh SlotBound.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SlotBound-APK
+          path: SlotBound.apk
+          if-no-files-found: error
